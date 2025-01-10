@@ -30,7 +30,7 @@ class GCGConfig:
     optim_str_init: Union[str, List[str]] = "x x x x x x x x x x x x x x x x x x x x"
     search_width: int = 512
     batch_size: int = None
-    topk: int = 256
+    topk: int = 256  # how many candidates to sample from
     n_replace: int = 1
     buffer_size: int = 0
     use_mellowmax: bool = False
@@ -42,33 +42,37 @@ class GCGConfig:
     add_space_before_target: bool = False
     seed: int = None
     verbosity: str = "INFO"
+    opt_or_pes: str = 'opt'
+    faster: bool = True
 
 @dataclass
 class GCGResult:
     best_loss: float
     best_string: str
+    best_reward: float
     losses: List[float]
     strings: List[str]
+    rewards: List[float]
 
 class AttackBuffer:
     def __init__(self, size: int):
-        self.buffer = [] # elements are (loss: float, optim_ids: Tensor)
+        self.buffer = [] # elements are (loss: float, reward: float, optim_ids: Tensor)
         self.size = size
 
-    def add(self, loss: float, optim_ids: Tensor) -> None:
+    def add(self, loss: float, reward: float, optim_ids: Tensor) -> None:
         if self.size == 0:
-            self.buffer = [(loss, optim_ids)]
+            self.buffer = [(loss, reward, optim_ids)]
             return
 
         if len(self.buffer) < self.size:
-            self.buffer.append((loss, optim_ids))
+            self.buffer.append((loss, reward, optim_ids))
         else:
-            self.buffer[-1] = (loss, optim_ids)
+            self.buffer[-1] = (loss, reward, optim_ids)
 
         self.buffer.sort(key=lambda x: x[0])
 
     def get_best_ids(self) -> Tensor:
-        return self.buffer[0][1]
+        return self.buffer[0][2]
 
     def get_lowest_loss(self) -> float:
         return self.buffer[0][0]
@@ -78,12 +82,15 @@ class AttackBuffer:
     
     def log_buffer(self, tokenizer):
         message = "buffer:"
-        for loss, ids in self.buffer:
+        for loss, reward, ids in self.buffer:
             optim_str = tokenizer.batch_decode(ids)[0]
             optim_str = optim_str.replace("\\", "\\\\")
             optim_str = optim_str.replace("\n", "\\n")
-            message += f"\nloss: {loss}" + f" | string: {optim_str}"
+            message += f"\nloss: {loss}" + f" | string: {optim_str} | reward: {reward}"
         logger.info(message)
+
+    def get_ids(self):
+        return [ids for (_, _, ids) in self.buffer]
 
 def sample_ids_from_grad(
     ids: Tensor, 
@@ -132,7 +139,7 @@ def sample_ids_from_grad(
 
     return new_ids
 
-def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
+def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer, buffer_ids):
     """Filters out sequeneces of token ids that change after retokenization.
 
     Args:
@@ -160,6 +167,8 @@ def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
             "No token sequences are the same after decoding and re-encoding. "
             "Consider setting `filter_ids=False` or trying a different `optim_str_init`"
         )
+    # also remove any sequences that are already present in the buffer
+    filtered_ids = [id for id in filtered_ids if not any([(id == c_).all() for c_ in buffer_ids])]
     
     return torch.stack(filtered_ids)
 
@@ -177,6 +186,9 @@ class GCG:
         self.embedding_layer = model.get_input_embeddings()
         self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=model.device)
         self.prefix_cache = None
+        self.maximize = True if self.config.opt_or_pes == 'opt' else False
+        self.w = 1#4 # FasterGCG paper uses 4 or 5 depending on model
+        self.faster = config.faster
 
         self.stop_flag = False
 
@@ -192,8 +204,7 @@ class GCG:
     
     def run(
         self,
-        messages: Union[str, List[dict]],
-        target: str,
+        prompts: Union[str, List[dict]],
     ) -> GCGResult:
         model = self.model
         tokenizer = self.tokenizer
@@ -203,53 +214,55 @@ class GCG:
             set_seed(config.seed)
             torch.use_deterministic_algorithms(True, warn_only=True)
     
-        if isinstance(messages, str):
-            messages = [{"role": "user", "content": messages}]
+        if isinstance(prompts, str):
+            messages = [{"role": "user", "content": prompts}, {'role': 'assistant', 'content':''}]
         else:
-            messages = copy.deepcopy(messages)
+            messages = copy.deepcopy(prompts)
     
         # Append the GCG string at the end of the prompt if location not specified
         if not any(["{optim_str}" in d["content"] for d in messages]):
             messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
 
-        template = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) 
+        template = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False) 
         # Remove the BOS token -- this will get added when tokenizing, if necessary
         if tokenizer.bos_token and template.startswith(tokenizer.bos_token):
             template = template.replace(tokenizer.bos_token, "")
         before_str, after_str = template.split("{optim_str}")
-
-        target = " " + target if config.add_space_before_target else target
+        # target = " " + target if config.add_space_before_target else target
 
         # Tokenize everything that doesn't get optimized
-        before_ids = tokenizer([before_str], padding=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
-        after_ids = tokenizer([after_str], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
-        target_ids = tokenizer([target], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
+        before = tokenizer([before_str], padding=False, return_tensors="pt")
+        before_ids = before["input_ids"].to(model.device, torch.int64)
+        after = tokenizer([after_str], add_special_tokens=False, return_tensors="pt")
+        after_ids = after["input_ids"].to(model.device, torch.int64)
+        # target_ids = tokenizer([target], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
 
         # Embed everything that doesn't get optimized
         embedding_layer = self.embedding_layer
-        before_embeds, after_embeds, target_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)]
-
+        # before_embeds, after_embeds, target_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)]
+        before_embeds, after_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids)]
         # Compute the KV Cache for tokens that appear before the optimized tokens
-        if config.use_prefix_cache:
-            with torch.no_grad():
-                output = model(inputs_embeds=before_embeds, use_cache=True)
-                self.prefix_cache = output.past_key_values
+        # if config.use_prefix_cache:
+        #     with torch.no_grad():
+        #         output = model(inputs_embeds=before_embeds, use_cache=True)
+        #         self.prefix_cache = output.past_key_values
         
-        self.target_ids = target_ids
+        # self.target_ids = target_ids
         self.before_embeds = before_embeds
         self.after_embeds = after_embeds
-        self.target_embeds = target_embeds
+        # self.target_embeds = target_embeds
 
-        # Initialize the attack buffer
+        # Initialize the response buffer
         buffer = self.init_buffer()
         optim_ids = buffer.get_best_ids()
 
         losses = []
         optim_strings = []
+        rewards = []
         
         for _ in tqdm(range(config.num_steps)):
             # Compute the token gradient
-            optim_ids_onehot_grad = self.compute_token_gradient(optim_ids) 
+            optim_ids_onehot_grad = self.compute_token_gradient(optim_ids)
 
             with torch.no_grad():
 
@@ -264,7 +277,7 @@ class GCG:
                 )
 
                 if config.filter_ids:
-                    sampled_ids = filter_ids(sampled_ids, tokenizer)
+                    sampled_ids = filter_ids(sampled_ids, tokenizer, buffer.get_ids())
 
                 new_search_width = sampled_ids.shape[0]
 
@@ -274,24 +287,25 @@ class GCG:
                     input_embeds = torch.cat([
                         embedding_layer(sampled_ids),
                         after_embeds.repeat(new_search_width, 1, 1),
-                        target_embeds.repeat(new_search_width, 1, 1),
                     ], dim=1)
                 else:
                     input_embeds = torch.cat([
                         before_embeds.repeat(new_search_width, 1, 1),
                         embedding_layer(sampled_ids),
                         after_embeds.repeat(new_search_width, 1, 1),
-                        target_embeds.repeat(new_search_width, 1, 1),
                     ], dim=1)
-                loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
+
+                loss, reward = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
 
                 current_loss = loss.min().item()
                 optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
+                current_reward = reward[loss.argmin()].item()
 
                 # Update the buffer based on the loss
                 losses.append(current_loss)
+                rewards.append(current_reward)
                 if buffer.size == 0 or current_loss < buffer.get_highest_loss():
-                    buffer.add(current_loss, optim_ids)
+                    buffer.add(current_loss, current_reward, optim_ids)
 
             optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
@@ -308,7 +322,9 @@ class GCG:
         result = GCGResult(
             best_loss=losses[min_loss_index],
             best_string=optim_strings[min_loss_index],
+            best_reward=rewards[min_loss_index],
             losses=losses,
+            rewards=rewards,
             strings=optim_strings,
         )
 
@@ -348,21 +364,22 @@ class GCG:
             init_buffer_embeds = torch.cat([
                 self.embedding_layer(init_buffer_ids),
                 self.after_embeds.repeat(true_buffer_size, 1, 1),
-                self.target_embeds.repeat(true_buffer_size, 1, 1),
+                # self.target_embeds.repeat(true_buffer_size, 1, 1),
             ], dim=1)
         else:
             init_buffer_embeds = torch.cat([
                 self.before_embeds.repeat(true_buffer_size, 1, 1),
                 self.embedding_layer(init_buffer_ids),
                 self.after_embeds.repeat(true_buffer_size, 1, 1),
-                self.target_embeds.repeat(true_buffer_size, 1, 1),
+                # self.target_embeds.repeat(true_buffer_size, 1, 1),
             ], dim=1)
 
-        init_buffer_losses = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds)
+
+        init_buffer_losses, init_buffer_reward = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds)
 
         # Populate the buffer
         for i in range(true_buffer_size):
-            buffer.add(init_buffer_losses[i], init_buffer_ids[[i]])
+            buffer.add(init_buffer_losses[i], init_buffer_reward[i], init_buffer_ids[[i]])
         
         buffer.log_buffer(tokenizer)
 
@@ -382,6 +399,7 @@ class GCG:
         """
         model = self.model
         embedding_layer = self.embedding_layer
+        cap = 30
 
         # Create the one-hot encoding matrix of our optimized token ids
         optim_ids_onehot = torch.nn.functional.one_hot(optim_ids, num_classes=embedding_layer.num_embeddings)
@@ -392,29 +410,37 @@ class GCG:
         optim_embeds = optim_ids_onehot @ embedding_layer.weight
 
         if self.prefix_cache:
-            input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
+            input_embeds = torch.cat([optim_embeds, self.after_embeds], dim=1)
             output = model(inputs_embeds=input_embeds, past_key_values=self.prefix_cache)
         else:
-            input_embeds = torch.cat([self.before_embeds, optim_embeds, self.after_embeds, self.target_embeds], dim=1)
+            input_embeds = torch.cat([self.before_embeds, optim_embeds, self.after_embeds], dim=1)
             output = model(inputs_embeds=input_embeds)
-
+            
         logits = output.logits
-
-        # Shift logits so token n-1 predicts token n
-        shift = input_embeds.shape[1] - self.target_ids.shape[1]
-        shift_logits = logits[..., shift-1:-1, :].contiguous() # (1, num_target_ids, vocab_size)
-        shift_labels = self.target_ids
-
-        if self.config.use_mellowmax:
-            label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
+        
+        if self.maximize:
+            loss = torch.nn.functional.mse_loss(logits, torch.tensor(cap, dtype=model.dtype).view(1, 1).to(self.model.device))
         else:
-            loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = torch.nn.functional.mse_loss(logits, torch.tensor(cap, dtype=model.dtype).view(1, 1).to(self.model.device))
+        optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0] # (1, response_length, vocabulary size)
 
-        optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
-
-        return optim_ids_onehot_grad
+        if self.faster:  # Regularize as in FasterGCG paper
+            distance = self.compute_token_distance(optim_embeds)
+            print(f'{torch.mean(optim_ids_onehot_grad)} {torch.mean(distance)}')
+            return optim_ids_onehot_grad + self.w * distance
+        else:
+            return optim_ids_onehot_grad
     
+    def compute_token_distance(
+        self,
+        optim_embeds: Tensor,
+    ) -> Tensor:
+        """Computes the distance in embedding space for all possible token swaps."""
+        embedding_layer = self.embedding_layer
+        all_tokens_embeds = embedding_layer(torch.arange(0, embedding_layer.num_embeddings).long().to(self.model.device))
+        distance = torch.cdist(optim_embeds, all_tokens_embeds.unsqueeze(0))
+        return distance
+
     def compute_candidates_loss(
         self,
         search_batch_size: int, 
@@ -429,7 +455,9 @@ class GCG:
                 the embeddings of the `search_width` candidate sequences to evaluate
         """
         all_loss = []
+        all_reward = []
         prefix_cache_batch = []
+        cap = 30 #self.model.config.final_logit_softcapping
 
         for i in range(0, input_embeds.shape[0], search_batch_size):
             with torch.no_grad():
@@ -440,42 +468,37 @@ class GCG:
                     if not prefix_cache_batch or current_batch_size != search_batch_size:
                         prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
 
-                    outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch)
+                    rewards = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch).logits
                 else:
-                    outputs = self.model(inputs_embeds=input_embeds_batch)
+                    rewards = self.model(inputs_embeds=input_embeds_batch).logits
 
-                logits = outputs.logits
-
-                tmp = input_embeds.shape[1] - self.target_ids.shape[1]
-                shift_logits = logits[..., tmp-1:-1, :].contiguous()
-                shift_labels = self.target_ids.repeat(current_batch_size, 1)
-                
-                if self.config.use_mellowmax:
-                    label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-                    loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
+                if self.maximize:
+                    target = torch.tensor(cap).expand(current_batch_size, 1).to(self.model.device)
                 else:
-                    loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
+                    target = torch.tensor(-cap).expand(current_batch_size, 1).to(self.model.device)
+                loss = torch.nn.functional.mse_loss(rewards, target, reduction="none")
 
                 loss = loss.view(current_batch_size, -1).mean(dim=-1)
+                rewards = rewards.view(current_batch_size, -1).mean(dim=-1)
                 all_loss.append(loss)
+                all_reward.append(rewards)
 
-                if self.config.early_stop:
-                    if torch.any(torch.all(torch.argmax(shift_logits, dim=-1) == shift_labels, dim=-1)).item():
-                        self.stop_flag = True
+                # if self.config.early_stop:
+                #     if torch.any(torch.all(torch.argmax(shift_logits, dim=-1) == shift_labels, dim=-1)).item():
+                #         self.stop_flag = True
 
-                del outputs
-                gc.collect()
+                # del rewards
+                # gc.collect()
                 torch.cuda.empty_cache()
 
-        return torch.cat(all_loss, dim=0)
+        return torch.cat(all_loss, dim=0), torch.cat(all_reward, dim=0)
 
 # A wrapper around the GCG `run` method that provides a simple API
 def run(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
-    messages: Union[str, List[dict]],
-    target: str,
-    config: Optional[GCGConfig] = None, 
+    prompts: Union[str, List[dict]],
+    config: Optional[GCGConfig] = None,
 ) -> GCGResult:
     """Generates a single optimized string using GCG. 
 
@@ -491,10 +514,10 @@ def run(
     """
     if config is None:
         config = GCGConfig()
-    
+
     logger.setLevel(getattr(logging, config.verbosity))
-    
+
     gcg = GCG(model, tokenizer, config)
-    result = gcg.run(messages, target)
+    result = gcg.run(prompts)
     return result
     

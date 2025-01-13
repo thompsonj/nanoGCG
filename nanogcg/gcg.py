@@ -1,6 +1,7 @@
 import copy
 import gc
 import logging
+import os
 
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -11,7 +12,9 @@ import transformers
 from torch import Tensor
 from transformers import set_seed
 
-from nanogcg.utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, mellowmax
+from nanogcg.utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, unravel_index
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 logger = logging.getLogger("nanogcg")
 if not logger.hasHandlers():
@@ -53,7 +56,34 @@ class GCGResult:
     losses: List[float]
     strings: List[str]
     rewards: List[float]
+    ids: List[int]
 
+
+class GCGHistory:
+    def __init__(self):
+        self.history = set()
+
+    def add(self, optim_ids) -> None:
+        for id in optim_ids.cpu().numpy(): 
+            self.history.add(str(id))
+        
+        # if self.history == []:
+        #     self.history = optim_ids
+        # else:    
+        #     self.history = torch.concat((self.history, optim_ids), dim=0)        
+        # if isinstance(optim_ids, list):
+        #     self.history.extend(optim_ids)
+        # else:
+        #     self.history.append(optim_ids)
+    
+    def get_history(self) -> Tensor:
+        return self.history
+        # if self.history:
+        #     return torch.concat(self.history, dim=0).squeeze()
+        # else:
+        #     return self.history
+    
+        
 class AttackBuffer:
     def __init__(self, size: int):
         self.buffer = [] # elements are (loss: float, reward: float, optim_ids: Tensor)
@@ -99,6 +129,7 @@ def sample_ids_from_grad(
     topk: int = 256,
     n_replace: int = 1,
     not_allowed_ids: Tensor = False,
+    start_idx: int = 0
 ):
     """Returns `search_width` combinations of token ids based on the token gradient.
 
@@ -126,20 +157,25 @@ def sample_ids_from_grad(
     if not_allowed_ids is not None:
         grad[:, not_allowed_ids.to(grad.device)] = float("inf")
 
-    topk_ids = (-grad).topk(topk, dim=1).indices
+    sampled_ids_pos,sampled_ids_val = unravel_index((-grad.view((-1,))).topk(start_idx + search_width).indices, grad.shape)
+    pos = sampled_ids_pos[start_idx:start_idx+search_width].unsqueeze(dim=-1)
+    val = sampled_ids_val[start_idx:start_idx+search_width].unsqueeze(dim=-1)
+    new_ids = original_ids.scatter_(1, pos, val)
 
-    sampled_ids_pos = torch.argsort(torch.rand((search_width, n_optim_tokens), device=grad.device))[..., :n_replace]
-    sampled_ids_val = torch.gather(
-        topk_ids[sampled_ids_pos],
-        2,
-        torch.randint(0, topk, (search_width, n_replace, 1), device=grad.device)
-    ).squeeze(2)
+    # topk_ids = (-grad).topk(topk, dim=1).indices
 
-    new_ids = original_ids.scatter_(1, sampled_ids_pos, sampled_ids_val)
+    # sampled_ids_pos = torch.argsort(torch.rand((search_width, n_optim_tokens), device=grad.device))[..., :n_replace] # which position(s) to swap in each candidate sequence
+    # sampled_ids_val = torch.gather(
+    #     topk_ids[sampled_ids_pos],
+    #     2,
+    #     torch.randint(0, topk, (search_width, n_replace, 1), device=grad.device)
+    # ).squeeze(2)
+
+    # new_ids = original_ids.scatter_(1, sampled_ids_pos, sampled_ids_val)
 
     return new_ids
 
-def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer, buffer_ids):
+def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer, history: set):
     """Filters out sequeneces of token ids that change after retokenization.
 
     Args:
@@ -152,25 +188,34 @@ def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer, buffer_
         filtered_ids : Tensor, shape = (new_search_width, n_optim_ids)
             all token ids that are the same after retokenization
     """
-    ids_decoded = tokenizer.batch_decode(ids)
-    filtered_ids = []
+    # ids_decoded = tokenizer.batch_decode(ids)
+    
+    # filtered_ids = []
 
-    for i in range(len(ids_decoded)):
-        # Retokenize the decoded token ids
-        ids_encoded = tokenizer(ids_decoded[i], return_tensors="pt", add_special_tokens=False).to(ids.device)["input_ids"][0]
-        if torch.equal(ids[i], ids_encoded):
-           filtered_ids.append(ids[i]) 
+    # for i in range(len(ids_decoded)):
+    #     # Retokenize the decoded token ids
+    #     ids_encoded = tokenizer(ids_decoded[i], return_tensors="pt", add_special_tokens=False).to(ids.device)["input_ids"][0]
+    #     if torch.equal(ids[i], ids_encoded):
+    #        filtered_ids.append(ids[i]) 
     
-    if not filtered_ids:
-        # This occurs in some cases, e.g. using the Llama-3 tokenizer with a bad initialization
-        raise RuntimeError(
-            "No token sequences are the same after decoding and re-encoding. "
-            "Consider setting `filter_ids=False` or trying a different `optim_str_init`"
-        )
-    # also remove any sequences that are already present in the buffer
-    filtered_ids = [id for id in filtered_ids if not any([(id == c_).all() for c_ in buffer_ids])]
+    # if not filtered_ids:
+    #     # This occurs in some cases, e.g. using the Llama-3 tokenizer with a bad initialization
+    #     raise RuntimeError(
+    #         "No token sequences are the same after decoding and re-encoding. "
+    #         "Consider setting `filter_ids=False` or trying a different `optim_str_init`"
+    #     )
+        
+    filtered_ids = ids
+    # also remove any sequences that have already been tested
+    n_ids = len(filtered_ids)
+    # filtered_ids = [id for id in filtered_ids if not any([(id == c_).all() for c_ in history])]
+    filtered_ids = [id for id in filtered_ids if not str(id.cpu().numpy()) in history]
     
-    return torch.stack(filtered_ids)
+    # print(f'{len(filtered_ids)} sequences to test after {n_ids - len(filtered_ids)} repeats removed')
+    if filtered_ids:
+        return torch.stack(filtered_ids)
+    else:
+        return []
 
 class GCG:
     def __init__(
@@ -187,7 +232,7 @@ class GCG:
         self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=model.device)
         self.prefix_cache = None
         self.maximize = True if self.config.opt_or_pes == 'opt' else False
-        self.w = 1#4 # FasterGCG paper uses 4 or 5 depending on model
+        self.w = 5#4 # FasterGCG paper uses 4 or 5 depending on model
         self.faster = config.faster
 
         self.stop_flag = False
@@ -254,11 +299,13 @@ class GCG:
 
         # Initialize the response buffer
         buffer = self.init_buffer()
+        history = GCGHistory()
         optim_ids = buffer.get_best_ids()
 
         losses = []
         optim_strings = []
         rewards = []
+        ids = []
         
         for _ in tqdm(range(config.num_steps)):
             # Compute the token gradient
@@ -267,6 +314,7 @@ class GCG:
             with torch.no_grad():
 
                 # Sample candidate token sequences based on the token gradient
+                start_idx = 0
                 sampled_ids = sample_ids_from_grad(
                     optim_ids.squeeze(0),
                     optim_ids_onehot_grad.squeeze(0),
@@ -274,11 +322,50 @@ class GCG:
                     config.topk,
                     config.n_replace,
                     not_allowed_ids=self.not_allowed_ids,
+                    start_idx=start_idx
                 )
 
                 if config.filter_ids:
-                    sampled_ids = filter_ids(sampled_ids, tokenizer, buffer.get_ids())
-
+                    
+                    sampled_ids = filter_ids(sampled_ids, tokenizer, history.get_history())
+                    carry_on = False
+                    missing = len(sampled_ids) < config.search_width
+                    start_idx += config.search_width
+                    i = 0
+                    
+                    while missing > 0 and not carry_on:
+                        # Sample further candidate token sequences until search width is filled
+                        # try:
+                        print(f'how far to search the gradient for new sequences: {start_idx}', end="\r")
+                        more_sampled_ids = sample_ids_from_grad(
+                            optim_ids.squeeze(0),
+                            optim_ids_onehot_grad.squeeze(0),
+                            (config.search_width - len(sampled_ids)),
+                            config.topk + i,
+                            config.n_replace,
+                            not_allowed_ids=self.not_allowed_ids,
+                            start_idx=start_idx
+                        )
+                        start_idx += (config.search_width - len(sampled_ids))
+                        more_sampled_ids = filter_ids(more_sampled_ids, tokenizer, history.get_history())
+                        if len(more_sampled_ids) > missing:
+                            if sampled_ids == []:
+                                sampled_ids = more_sampled_ids[:missing]
+                            else:
+                                sampled_ids = torch.concat([sampled_ids, more_sampled_ids[:missing]])
+                        if len(more_sampled_ids) > 0:
+                            if sampled_ids == []:
+                                sampled_ids = more_sampled_ids
+                            else:
+                                sampled_ids = torch.concat([sampled_ids, more_sampled_ids])
+                        # except:
+                        #     # give up on filling the search width exactly
+                        #     if len(sampled_ids) > 0:
+                        #         carry_on = True
+                        missing = len(sampled_ids) < config.search_width
+                        i += 1
+                print('\n')
+                    
                 new_search_width = sampled_ids.shape[0]
 
                 # Compute loss on all candidate sequences 
@@ -296,16 +383,21 @@ class GCG:
                     ], dim=1)
 
                 loss, reward = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
+                history.add(sampled_ids)
 
                 current_loss = loss.min().item()
                 optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
                 current_reward = reward[loss.argmin()].item()
 
                 # Update the buffer based on the loss
+                print(f'Current loss: {current_loss}')
                 losses.append(current_loss)
                 rewards.append(current_reward)
+                ids.append(optim_ids.cpu().numpy()[0])
+
                 if buffer.size == 0 or current_loss < buffer.get_highest_loss():
                     buffer.add(current_loss, current_reward, optim_ids)
+                
 
             optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
@@ -326,6 +418,7 @@ class GCG:
             losses=losses,
             rewards=rewards,
             strings=optim_strings,
+            ids=ids
         )
 
         return result
@@ -420,14 +513,17 @@ class GCG:
         
         if self.maximize:
             loss = torch.nn.functional.mse_loss(logits, torch.tensor(cap, dtype=model.dtype).view(1, 1).to(self.model.device))
+            # loss = torch.nn.functional.l1_loss(logits, torch.tensor(cap, dtype=model.dtype).view(1, 1).to(self.model.device))
         else:
             loss = torch.nn.functional.mse_loss(logits, torch.tensor(cap, dtype=model.dtype).view(1, 1).to(self.model.device))
+            # loss = torch.nn.functional.l1_loss(logits, torch.tensor(cap, dtype=model.dtype).view(1, 1).to(self.model.device))
+  
         optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0] # (1, response_length, vocabulary size)
 
         if self.faster:  # Regularize as in FasterGCG paper
             distance = self.compute_token_distance(optim_embeds)
-            print(f'{torch.mean(optim_ids_onehot_grad)} {torch.mean(distance)}')
-            return optim_ids_onehot_grad + self.w * distance
+            # print(f'{torch.min(optim_ids_onehot_grad)} {torch.max(distance)}')
+            return optim_ids_onehot_grad + self.w * distance # going to look at negative gradient in next step, 
         else:
             return optim_ids_onehot_grad
     
@@ -477,6 +573,7 @@ class GCG:
                 else:
                     target = torch.tensor(-cap).expand(current_batch_size, 1).to(self.model.device)
                 loss = torch.nn.functional.mse_loss(rewards, target, reduction="none")
+                # loss = torch.nn.functional.l1_loss(rewards, target, reduction="none")
 
                 loss = loss.view(current_batch_size, -1).mean(dim=-1)
                 rewards = rewards.view(current_batch_size, -1).mean(dim=-1)

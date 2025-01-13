@@ -112,3 +112,10 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
                     raise
 
     return decorator
+
+def unravel_index(index, shape):
+    out = []
+    for dim in reversed(shape):
+        out.append(index % dim)
+        index = index // dim
+    return tuple(reversed(out))

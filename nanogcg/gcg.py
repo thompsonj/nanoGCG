@@ -232,7 +232,7 @@ class GCG:
         self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=model.device)
         self.prefix_cache = None
         self.maximize = True if self.config.opt_or_pes == 'opt' else False
-        self.w = 5#4 # FasterGCG paper uses 4 or 5 depending on model
+        self.w = 4.5#4 # FasterGCG paper uses 4 or 5 depending on model
         self.faster = config.faster
 
         self.stop_flag = False
@@ -332,7 +332,7 @@ class GCG:
                     missing = len(sampled_ids) < config.search_width
                     start_idx += config.search_width
                     i = 0
-                    
+                    print('\n')
                     while missing > 0 and not carry_on:
                         # Sample further candidate token sequences until search width is filled
                         # try:
@@ -399,7 +399,7 @@ class GCG:
                     buffer.add(current_loss, current_reward, optim_ids)
                 
 
-            optim_ids = buffer.get_best_ids()
+            # optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
             optim_strings.append(optim_str)
 
